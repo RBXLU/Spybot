@@ -1,0 +1,10 @@
+{
+    "telegram_token": "ВАШ_ТОКЕН_БОТА",
+    "telegram_chat_id": "ВАШ_CHAT_ID",
+    "server_host": "0.0.0.0",
+    "server_port": 8080,
+    "server_url": "https://kimberly-refractometric-nonorthographically.ngrok.io",
+    "link_expire_hours": 24,
+    "screenshot_delay": 1,
+    "SAVE_SCREENSHOTS": true
+}

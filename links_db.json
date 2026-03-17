@@ -1,0 +1,42 @@
+{
+  "e4b78112-371": {
+    "id": "e4b78112-371",
+    "created": "2026-01-28T17:52:10.766362",
+    "expires": "2026-01-29T17:52:10.766362",
+    "name": "G-Mod-guide",
+    "clicks": 1,
+    "last_click": "2026-01-28T17:53:03.565561",
+    "screenshots": [
+      {
+        "timestamp": "2026-01-28T17:53:04.794731",
+        "type": "screenshot",
+        "size": 372125,
+        "filename": "captures\\screenshots\\e4b78112-371_20260128_175304.png"
+      }
+    ],
+    "metadata": {},
+    "active": true,
+    "clicks_history": [
+      {
+        "timestamp": "2026-01-28T17:53:03.565561",
+        "ip": "149.154.161.244",
+        "user_agent": "TelegramBot (like TwitterBot)",
+        "screenshot_taken": true
+      }
+    ],
+    "captures": [
+      {
+        "type": "screenshot",
+        "size": 372125,
+        "filename": "captures\\screenshots\\e4b78112-371_20260128_175304.png",
+        "timestamp": "2026-01-28T17:53:04.794731"
+      },
+      {
+        "type": "camera",
+        "size": 6098,
+        "filename": "captures\\camera\\e4b78112-371_webcam_20260128_175309.jpg",
+        "timestamp": "2026-01-28T17:53:09.786698"
+      }
+    ]
+  }
+}
